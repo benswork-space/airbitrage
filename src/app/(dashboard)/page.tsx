@@ -32,7 +32,7 @@ export default function DashboardHome() {
         sellPrice: o.sellPrice,
         sellSource: o.sellSource,
         sellUrl: o.sellUrl,
-        sellPriceType: o.sellPriceType || 'estimated',
+        sellPriceType: o.sellPriceType || (type === 'buyer-intent' ? 'verified' : 'estimated'),
         estimatedProfit: o.estimatedProfit,
         fees: o.fees,
         confidence: o.confidence,
@@ -43,6 +43,10 @@ export default function DashboardHome() {
         actualSellPrice: null,
         createdAt: new Date().toISOString(),
         expiresAt: null,
+        // Buy-intent specific fields
+        buyerUsername: o.buyerUsername,
+        buyerTradeCount: o.buyerTradeCount,
+        postAge: o.postAge,
       }))
     ),
     [agentStates],

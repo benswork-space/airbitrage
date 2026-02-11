@@ -80,6 +80,10 @@ export interface ParsedOpportunity {
   confidence: number;    // 0-100
   riskNotes: string[];
   reasoning: string;
+  // Buy-intent agent fields
+  buyerUsername?: string;
+  buyerTradeCount?: number;
+  postAge?: number;
 }
 
 // The structured output format we ask Claude to return
@@ -399,6 +403,7 @@ function extractFullReasoning(response: ClaudeResponse | null): string {
 export interface AgentProgressEvent {
   type:
     | 'started'
+    | 'scouting'
     | 'calling_claude'
     | 'tool_call'
     | 'tool_result'

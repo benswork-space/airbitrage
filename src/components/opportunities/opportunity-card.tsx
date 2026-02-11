@@ -13,6 +13,7 @@ interface OpportunityCardProps {
 
 export const OpportunityCard = memo(function OpportunityCard({ opportunity, showAgentType = true }: OpportunityCardProps) {
   const agentInfo = AGENT_TYPES[opportunity.agentType];
+  const isBuyerIntent = opportunity.agentType === 'buyer-intent';
 
   return (
     <Card hover className="flex flex-col gap-3 animate-fade-in">
@@ -42,12 +43,35 @@ export const OpportunityCard = memo(function OpportunityCard({ opportunity, show
         </div>
       </div>
 
+      {/* Buyer info bar for buy-intent opportunities */}
+      {isBuyerIntent && opportunity.buyerUsername && (
+        <div className="flex items-center gap-3 text-[11px] px-2.5 py-1.5 rounded-[var(--radius-sm)] bg-[rgba(0,212,170,0.06)] border border-[rgba(0,212,170,0.12)]">
+          <span className="text-[var(--color-accent)] font-medium">
+            u/{opportunity.buyerUsername}
+          </span>
+          {typeof opportunity.buyerTradeCount === 'number' && opportunity.buyerTradeCount > 0 && (
+            <span className="text-[var(--text-tertiary)]">
+              {opportunity.buyerTradeCount} trades
+            </span>
+          )}
+          <span className="text-[var(--text-tertiary)]">
+            {opportunity.sellSource}
+          </span>
+          {typeof opportunity.postAge === 'number' && (
+            <span className="text-[var(--text-tertiary)] ml-auto">
+              {opportunity.postAge}h ago
+            </span>
+          )}
+        </div>
+      )}
+
       <PriceDisplay
         buyPrice={opportunity.buyPrice}
         sellPrice={opportunity.sellPrice}
         buySource={opportunity.buySource}
         sellSource={opportunity.sellSource}
         sellPriceType={opportunity.sellPriceType}
+        agentType={opportunity.agentType}
       />
 
       <div className="flex items-center justify-between gap-3">
@@ -67,8 +91,8 @@ export const OpportunityCard = memo(function OpportunityCard({ opportunity, show
         </div>
       </div>
 
-      {/* Buy / Sell quick links */}
-      {(opportunity.buyUrl || opportunity.sellUrl) && (
+      {/* Action buttons — flipped for buy-intent */}
+      {isBuyerIntent ? (
         <div className="flex items-center gap-2 pt-1 border-t border-[var(--border-subtle)]">
           {opportunity.buyUrl && (
             <a
@@ -77,7 +101,7 @@ export const OpportunityCard = memo(function OpportunityCard({ opportunity, show
               rel="noopener noreferrer"
               className="flex-1 text-center text-[11px] font-medium py-1.5 px-2 rounded-[var(--radius-sm)] bg-[var(--color-accent-dim)] text-[var(--color-accent)] hover:bg-[var(--color-accent)] hover:text-[var(--bg-primary)] transition-colors"
             >
-              Buy — {opportunity.buySource}
+              Buy from Source
             </a>
           )}
           {opportunity.sellUrl && (
@@ -85,22 +109,48 @@ export const OpportunityCard = memo(function OpportunityCard({ opportunity, show
               href={opportunity.sellUrl}
               target="_blank"
               rel="noopener noreferrer"
-              className={`flex-1 text-center text-[11px] font-medium py-1.5 px-2 rounded-[var(--radius-sm)] transition-colors ${
-                opportunity.sellPriceType === 'verified'
-                  ? 'bg-[rgba(34,197,94,0.1)] text-[var(--color-profit)] hover:bg-[var(--color-profit)] hover:text-[var(--bg-primary)]'
-                  : opportunity.sellPriceType === 'research_needed'
-                    ? 'bg-[rgba(100,100,120,0.1)] text-[var(--text-secondary)] hover:bg-[var(--text-tertiary)] hover:text-[var(--bg-primary)]'
-                    : 'bg-[rgba(245,158,11,0.1)] text-[var(--color-warning)] hover:bg-[var(--color-warning)] hover:text-[var(--bg-primary)]'
-              }`}
+              className="flex-1 text-center text-[11px] font-medium py-1.5 px-2 rounded-[var(--radius-sm)] bg-[rgba(34,197,94,0.1)] text-[var(--color-profit)] hover:bg-[var(--color-profit)] hover:text-[var(--bg-primary)] transition-colors"
             >
-              {opportunity.sellPriceType === 'verified'
-                ? `Sell — ${opportunity.sellSource}`
-                : opportunity.sellPriceType === 'research_needed'
-                  ? `Find Price — ${opportunity.sellSource}`
-                  : `Research — ${opportunity.sellSource}`}
+              View Buyer Post
             </a>
           )}
         </div>
+      ) : (
+        /* Standard buy/sell links for other agents */
+        (opportunity.buyUrl || opportunity.sellUrl) && (
+          <div className="flex items-center gap-2 pt-1 border-t border-[var(--border-subtle)]">
+            {opportunity.buyUrl && (
+              <a
+                href={opportunity.buyUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex-1 text-center text-[11px] font-medium py-1.5 px-2 rounded-[var(--radius-sm)] bg-[var(--color-accent-dim)] text-[var(--color-accent)] hover:bg-[var(--color-accent)] hover:text-[var(--bg-primary)] transition-colors"
+              >
+                Buy — {opportunity.buySource}
+              </a>
+            )}
+            {opportunity.sellUrl && (
+              <a
+                href={opportunity.sellUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className={`flex-1 text-center text-[11px] font-medium py-1.5 px-2 rounded-[var(--radius-sm)] transition-colors ${
+                  opportunity.sellPriceType === 'verified'
+                    ? 'bg-[rgba(34,197,94,0.1)] text-[var(--color-profit)] hover:bg-[var(--color-profit)] hover:text-[var(--bg-primary)]'
+                    : opportunity.sellPriceType === 'research_needed'
+                      ? 'bg-[rgba(100,100,120,0.1)] text-[var(--text-secondary)] hover:bg-[var(--text-tertiary)] hover:text-[var(--bg-primary)]'
+                      : 'bg-[rgba(245,158,11,0.1)] text-[var(--color-warning)] hover:bg-[var(--color-warning)] hover:text-[var(--bg-primary)]'
+                }`}
+              >
+                {opportunity.sellPriceType === 'verified'
+                  ? `Sell — ${opportunity.sellSource}`
+                  : opportunity.sellPriceType === 'research_needed'
+                    ? `Find Price — ${opportunity.sellSource}`
+                    : `Research — ${opportunity.sellSource}`}
+              </a>
+            )}
+          </div>
+        )
       )}
 
       {opportunity.riskNotes.length > 0 && (

@@ -82,7 +82,7 @@ function createStore() {
   }
 
   function getAgentState(agentType: AgentType): AgentRunState {
-    return store[agentType];
+    return store[agentType] ?? INITIAL_STATE;
   }
 
   function getGlobalSnapshot(): GlobalSnapshot {
@@ -100,7 +100,9 @@ function createStore() {
   }
 
   function subscribeAgent(agentType: AgentType, listener: Listener) {
-    listeners[agentType]?.add(listener);
+    // Create listener set on-demand for inactive agents
+    if (!listeners[agentType]) listeners[agentType] = new Set();
+    listeners[agentType].add(listener);
     return () => { listeners[agentType]?.delete(listener); };
   }
 

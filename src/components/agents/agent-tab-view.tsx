@@ -36,6 +36,7 @@ function AgentTabViewInner({ agentType, agent, opportunities, runs }: AgentTabVi
   const agentRun = useAgentRun(agentType);
 
   // Convert live-discovered opportunities into full Opportunity objects
+  const isBuyerIntent = agentType === 'buyer-intent';
   const liveOpps: Opportunity[] = agentRun.opportunities.map((o, i) => ({
     id: `live-${i}`,
     agentRunId: 'live',
@@ -49,7 +50,7 @@ function AgentTabViewInner({ agentType, agent, opportunities, runs }: AgentTabVi
     sellPrice: o.sellPrice,
     sellSource: o.sellSource,
     sellUrl: o.sellUrl,
-    sellPriceType: o.sellPriceType || 'estimated',
+    sellPriceType: o.sellPriceType || (isBuyerIntent ? 'verified' : 'estimated'),
     estimatedProfit: o.estimatedProfit,
     fees: o.fees,
     confidence: o.confidence,
@@ -60,6 +61,10 @@ function AgentTabViewInner({ agentType, agent, opportunities, runs }: AgentTabVi
     actualSellPrice: null,
     createdAt: new Date().toISOString(),
     expiresAt: null,
+    // Buy-intent specific fields
+    buyerUsername: o.buyerUsername,
+    buyerTradeCount: o.buyerTradeCount,
+    postAge: o.postAge,
   }));
 
   const allOpportunities = [...liveOpps, ...opportunities];

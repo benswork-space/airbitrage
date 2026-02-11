@@ -1,4 +1,5 @@
 export type AgentType =
+  | 'buyer-intent'
   | 'listings'
   | 'auctions'
   | 'crypto'
@@ -87,6 +88,10 @@ export interface Opportunity {
   actualSellPrice: number | null;
   createdAt: string;
   expiresAt: string | null;
+  // Buy-intent agent fields
+  buyerUsername?: string;
+  buyerTradeCount?: number;
+  postAge?: number;
 }
 
 export interface WatchlistItem {
@@ -116,6 +121,16 @@ export interface AgentTypeInfo {
 }
 
 export const AGENT_TYPES: Record<AgentType, AgentTypeInfo> = {
+  'buyer-intent': {
+    type: 'buyer-intent',
+    name: 'Buy Intent Agent',
+    shortName: 'Buy Intent',
+    description: 'Reddit swap subs + Craigslist wanted — proven buyer demand',
+    icon: '🎯',
+    color: '#00d4aa',
+    sources: ['Reddit Swap Subs', 'Craigslist Wanted', 'eBay', 'Amazon', 'Mercari'],
+    active: true,
+  },
   listings: {
     type: 'listings',
     name: 'Listings Agent',
@@ -124,7 +139,7 @@ export const AGENT_TYPES: Record<AgentType, AgentTypeInfo> = {
     icon: '🏷',
     color: '#3b82f6',
     sources: ['Craigslist', 'FB Marketplace', 'OfferUp'],
-    active: true,
+    active: false,
   },
   auctions: {
     type: 'auctions',
@@ -134,7 +149,7 @@ export const AGENT_TYPES: Record<AgentType, AgentTypeInfo> = {
     icon: '🔨',
     color: '#f59e0b',
     sources: ['eBay', 'GSA Auctions', 'GovDeals'],
-    active: true,
+    active: false,
   },
   crypto: {
     type: 'crypto',
@@ -154,7 +169,7 @@ export const AGENT_TYPES: Record<AgentType, AgentTypeInfo> = {
     icon: '🛒',
     color: '#ec4899',
     sources: ['Slickdeals', 'DealNews', 'Reddit'],
-    active: true,
+    active: false,
   },
   tickets: {
     type: 'tickets',
@@ -174,7 +189,7 @@ export const AGENT_TYPES: Record<AgentType, AgentTypeInfo> = {
     icon: '💎',
     color: '#06b6d4',
     sources: ['Discogs', 'StockX/kicks.dev', 'JustTCG'],
-    active: true,
+    active: false,
   },
   books: {
     type: 'books',
@@ -184,7 +199,7 @@ export const AGENT_TYPES: Record<AgentType, AgentTypeInfo> = {
     icon: '📚',
     color: '#22c55e',
     sources: ['Open Library', 'Amazon', 'eBay'],
-    active: true,
+    active: false,
   },
 };
 

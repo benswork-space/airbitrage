@@ -1,14 +1,14 @@
 /**
- * Unified agent runner — dispatches to the scout-then-snipe system.
- * All agents now use the same pattern:
- *   1. Scout: free APIs + Tavily batch search (no Claude)
- *   2. Filter: programmatic price-spread detection
- *   3. Snipe: single Claude call on pre-qualified leads only
+ * Unified agent runner — dispatches to the appropriate pipeline.
+ *
+ * - buyer-intent: harvest Reddit/Craigslist buy posts → find source → verify
+ * - all others: scout-then-snipe (legacy agents, currently disabled)
  */
 
 import { AgentType } from '@/types';
 import { AgentProgressEvent } from './base-agent';
 import { runScoutThenSnipe, ScoutSnipeResult } from './scout/runner';
+import { runBuyerIntentPipeline, BuyerIntentResult } from './buyer-intent/runner';
 
 // Re-export for compatibility with existing stream API
 export type { AgentProgressEvent };
@@ -30,9 +30,19 @@ export interface RunAgentParams {
 export async function dispatchAgentRun(
   params: RunAgentParams,
   onProgress?: (event: AgentProgressEvent) => void,
-): Promise<ScoutSnipeResult> {
+): Promise<ScoutSnipeResult | BuyerIntentResult> {
   const { agentType, apiKey, tavilyApiKey, config } = params;
 
+  // Route buyer-intent to the new pipeline
+  if (agentType === 'buyer-intent') {
+    return runBuyerIntentPipeline(
+      { agentType: 'buyer-intent', apiKey, tavilyApiKey },
+      config,
+      onProgress,
+    );
+  }
+
+  // Legacy agents use scout-then-snipe
   return runScoutThenSnipe(
     { agentType, apiKey, tavilyApiKey },
     config,
