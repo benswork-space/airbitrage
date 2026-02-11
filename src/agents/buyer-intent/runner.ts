@@ -1,10 +1,12 @@
 /**
- * Buy-Intent Pipeline Runner
+ * Buy-Intent Pipeline Runner — BRUTE FORCE MODE
  *
  * Orchestrates the 3-phase pipeline:
- * 1. HARVEST — fetch buy-intent posts from Reddit + Craigslist (free)
- * 2. SOURCE — find cheaper listings on eBay/Amazon/Mercari (Tavily cost)
- * 3. VERIFY — Claude confirms product match + fees (Claude cost, only if matches found)
+ * 1. HARVEST — fetch buy-intent posts from Reddit swap subs (free)
+ * 2. SOURCE — find cheaper listings via Tavily (up to 50 searches, ~$0.05)
+ * 3. VERIFY — Claude confirms product match + fees (only if matches found)
+ *
+ * Timeout: 4 minutes (harvest ~6s, source ~30-60s, verify ~5s)
  */
 
 import { callClaude, ClaudeResponse } from '@/lib/claude';
@@ -35,6 +37,7 @@ export interface BuyerIntentResult {
     intentsFound: number;
     intentsSearched: number;
     matchesFound: number;
+    tavilySearches: number;
     sourcesChecked: string[];
     diagnostics: Array<{ source: string; status: string; itemCount: number }>;
   };
@@ -50,49 +53,49 @@ export async function runBuyerIntentPipeline(
   let totalInputTokens = 0;
   let totalOutputTokens = 0;
 
-  // 2-minute timeout
+  // 4-minute timeout
   const runTimeout = setTimeout(() => {
-    onProgress?.({ type: 'error', message: 'Agent run timed out after 2 minutes.' });
-  }, 120000);
+    onProgress?.({ type: 'error', message: 'Agent run timed out after 4 minutes.' });
+  }, 240000);
 
   try {
     // ── Phase 1: HARVEST (free — Reddit swap subs) ──────────────────
 
     onProgress?.({
       type: 'scouting',
-      message: 'Harvesting buy-intent posts from Reddit swap subs...',
+      message: 'Harvesting buy-intent posts from 14 Reddit swap subs (100 posts each)...',
     });
 
     const harvest = await harvestBuyIntents();
 
-    // Build source breakdown for progress message
+    const pricedCount = harvest.intents.filter(i => i.hasStatedPrice).length;
+    const pricelessCount = harvest.intents.length - pricedCount;
+
+    // Build source breakdown
     const sourceCounts = new Map<string, number>();
     for (const intent of harvest.intents) {
       sourceCounts.set(intent.source, (sourceCounts.get(intent.source) || 0) + 1);
     }
     const sourceBreakdown = [...sourceCounts.entries()]
       .sort((a, b) => b[1] - a[1])
-      .slice(0, 3)
+      .slice(0, 4)
       .map(([src, cnt]) => `${cnt} from ${src}`)
       .join(', ');
 
     onProgress?.({
       type: 'scouting',
-      message: `Found ${harvest.intents.length} buy-intent posts${sourceBreakdown ? ` (${sourceBreakdown})` : ''}. Top price: ${harvest.intents[0] ? `$${(harvest.intents[0].maxPrice / 100).toFixed(0)}` : 'N/A'}.`,
-      data: { intents: harvest.intents.length, sources: Object.fromEntries(sourceCounts) },
+      message: `Found ${harvest.intents.length} buy-intent posts (${pricedCount} with price, ${pricelessCount} without). ${sourceBreakdown}.`,
+      data: { intents: harvest.intents.length, priced: pricedCount, priceless: pricelessCount },
     });
 
     if (harvest.intents.length === 0) {
       clearTimeout(runTimeout);
-      onProgress?.({
-        type: 'completed',
-        message: 'No buy-intent posts found with prices. Try again later — Reddit posts refresh continuously.',
-      });
+      onProgress?.({ type: 'completed', message: 'No buy-intent posts found. Try again later.' });
 
       return {
         success: true,
         opportunities: [],
-        reasoning: 'No buy-intent posts found matching criteria (price >= $50, age <= 48h, price stated in title or body).',
+        reasoning: 'No buy-intent posts found in any subreddit within the 72h window.',
         totalInputTokens: 0,
         totalOutputTokens: 0,
         totalToolCalls: 0,
@@ -101,17 +104,20 @@ export async function runBuyerIntentPipeline(
           intentsFound: 0,
           intentsSearched: 0,
           matchesFound: 0,
+          tavilySearches: 0,
           sourcesChecked: harvest.diagnostics.map(d => d.source),
           diagnostics: harvest.diagnostics,
         },
       };
     }
 
-    // ── Phase 2: SOURCE (Tavily cost) ──────────────────────────────────
+    // ── Phase 2: SOURCE (Tavily — up to 50 searches) ──────────────────
+
+    const searchCount = Math.min(harvest.intents.length, 50);
 
     onProgress?.({
       type: 'scouting',
-      message: `Searching for source listings for top ${Math.min(harvest.intents.length, 15)} buy intents...`,
+      message: `Searching for source listings across ${searchCount} buy intents (~$${(searchCount * 0.001).toFixed(2)} Tavily cost)...`,
     });
 
     const sourceResult = await findSourcesForIntents(
@@ -122,38 +128,38 @@ export async function runBuyerIntentPipeline(
 
     onProgress?.({
       type: 'scouting',
-      message: `Found ${sourceResult.matched.length} profitable matches from ${harvest.intents.length} buy-intent posts.`,
-      data: { matches: sourceResult.matched.length },
+      message: `Found ${sourceResult.matched.length} profitable matches from ${searchCount} searches (${sourceResult.tavilyCallCount} Tavily calls).`,
+      data: { matches: sourceResult.matched.length, tavilyCalls: sourceResult.tavilyCallCount },
     });
 
     if (sourceResult.matched.length === 0) {
       clearTimeout(runTimeout);
       onProgress?.({
         type: 'completed',
-        message: `Searched ${Math.min(harvest.intents.length, 15)} buy intents — no profitable source listings found. The buyers may be offering fair market prices.`,
+        message: `Searched ${searchCount} buy intents (${sourceResult.tavilyCallCount} Tavily calls) — no profitable matches found.`,
       });
 
       return {
         success: true,
         opportunities: [],
-        reasoning: 'No profitable matches found — source prices were at or above buyer prices after fees.',
+        reasoning: `Searched ${searchCount} buy intents — source prices were at or above buyer prices after fees.`,
         totalInputTokens: 0,
         totalOutputTokens: 0,
         totalToolCalls: 0,
-        estimatedCost: 0,
+        estimatedCost: sourceResult.tavilyCallCount * 0.001,
         scoutStats: {
           intentsFound: harvest.intents.length,
-          intentsSearched: Math.min(harvest.intents.length, 15),
+          intentsSearched: searchCount,
           matchesFound: 0,
+          tavilySearches: sourceResult.tavilyCallCount,
           sourcesChecked: [...harvest.diagnostics, ...sourceResult.diagnostics].map(d => d.source),
           diagnostics: [...harvest.diagnostics, ...sourceResult.diagnostics],
         },
       };
     }
 
-    // ── Phase 3: VERIFY (Claude cost — only if matches found) ──────────
+    // ── Phase 3: VERIFY (Claude — only if matches found) ──────────────
 
-    // Budget check before calling Claude
     const budgetConfig = await loadBudgetConfig();
     const budget = await checkBudget(budgetConfig);
     if (!budget.allowed) {
@@ -165,14 +171,14 @@ export async function runBuyerIntentPipeline(
         totalInputTokens: 0,
         totalOutputTokens: 0,
         totalToolCalls: 0,
-        estimatedCost: 0,
+        estimatedCost: sourceResult.tavilyCallCount * 0.001,
         abortReason: `Daily token budget exceeded (${budget.used.toLocaleString()} / ${budget.limit.toLocaleString()})`,
       };
     }
 
     onProgress?.({
       type: 'calling_claude',
-      message: `Sending ${sourceResult.matched.length} matched opportunities to Claude for verification...`,
+      message: `Sending ${sourceResult.matched.length} matches to Claude for verification...`,
     });
 
     const verifyPrompt = buildVerificationPrompt(sourceResult.matched);
@@ -192,14 +198,15 @@ export async function runBuyerIntentPipeline(
     await recordUsage('buyer-intent', totalInputTokens, totalOutputTokens, 0);
 
     const opportunities = parseOpportunities(response);
-    const cost = estimateCost(totalInputTokens, totalOutputTokens);
+    const claudeCost = estimateCost(totalInputTokens, totalOutputTokens);
+    const totalCost = claudeCost + (sourceResult.tavilyCallCount * 0.001);
 
     clearTimeout(runTimeout);
 
     onProgress?.({
       type: 'completed',
-      message: `Verified ${opportunities.length} opportunities from ${sourceResult.matched.length} matches. ${totalInputTokens + totalOutputTokens} tokens ($${cost.toFixed(4)}).`,
-      data: { opportunities: opportunities.length, tokens: totalInputTokens + totalOutputTokens, cost },
+      message: `Verified ${opportunities.length} opportunities from ${sourceResult.matched.length} matches. ${sourceResult.tavilyCallCount} Tavily searches + ${totalInputTokens + totalOutputTokens} tokens = $${totalCost.toFixed(4)}.`,
+      data: { opportunities: opportunities.length, tokens: totalInputTokens + totalOutputTokens, cost: totalCost },
     });
 
     return {
@@ -209,11 +216,12 @@ export async function runBuyerIntentPipeline(
       totalInputTokens,
       totalOutputTokens,
       totalToolCalls: 1,
-      estimatedCost: cost,
+      estimatedCost: totalCost,
       scoutStats: {
         intentsFound: harvest.intents.length,
-        intentsSearched: Math.min(harvest.intents.length, 15),
+        intentsSearched: searchCount,
         matchesFound: sourceResult.matched.length,
+        tavilySearches: sourceResult.tavilyCallCount,
         sourcesChecked: [...harvest.diagnostics, ...sourceResult.diagnostics].map(d => d.source),
         diagnostics: [...harvest.diagnostics, ...sourceResult.diagnostics],
       },
@@ -239,34 +247,41 @@ export async function runBuyerIntentPipeline(
 
 // ─── Claude Verification ─────────────────────────────────────────────────────
 
-const VERIFY_SYSTEM_PROMPT = `You are verifying arbitrage opportunities from Reddit and Craigslist buy-intent posts.
+const VERIFY_SYSTEM_PROMPT = `You are verifying arbitrage opportunities from Reddit buy-intent posts.
 
-Each match pairs a REAL BUYER (someone on Reddit/Craigslist who posted wanting to buy a specific item at a stated price) with a SOURCE LISTING (the same item available on a marketplace for a lower price).
+Each match pairs a REAL BUYER (someone on Reddit who posted wanting to buy a specific item) with a SOURCE LISTING (the same item available on a marketplace for a lower price).
 
 Your job is to verify each match and output structured opportunities.
 
 For each match, check:
-1. PRODUCT MATCH — Is the source listing the same product the buyer wants? Same brand, model, specs. If the source listing is clearly a different product, skip it.
-2. CONDITION — If the buyer wants "new" but the source is "used" (or vice versa), note it in riskNotes.
-3. FEES — PayPal G&S (3.49% + $0.49) + shipping. Our estimates may be rough — adjust if clearly wrong.
-4. CONFIDENCE — Score 0-100 based on: product match certainty, buyer reputation, profit margin, listing freshness.
+1. PRODUCT MATCH — Is the source listing the same product the buyer wants? Same brand, model, specs.
+2. CONDITION — Note any condition mismatches in riskNotes.
+3. FEES — PayPal G&S (3.49% + $0.49) + shipping. Adjust if our estimates seem wrong.
+4. CONFIDENCE — Score 0-100.
 
-Be generous — include matches where the product is reasonably identifiable. The user will make the final decision.`;
+Be GENEROUS — include matches where the product is reasonably identifiable. The user makes the final decision. Include anything that looks like it could be profitable, even if uncertain.`;
 
 function buildVerificationPrompt(matches: MatchedOpportunity[]): string {
-  const matchSummaries = matches.map((m, i) => {
+  // Cap at 20 matches to keep prompt size reasonable
+  const topMatches = matches.slice(0, 20);
+
+  const matchSummaries = topMatches.map((m, i) => {
+    const priceType = m.estimatedMarketPrice
+      ? `(est. market price: $${(m.estimatedMarketPrice / 100).toFixed(2)})`
+      : `(buyer stated: $${(m.buyIntent.maxPrice / 100).toFixed(2)})`;
+
     return `[Match ${i + 1}]
-BUYER: "${m.buyIntent.itemWanted}" for $${(m.buyIntent.maxPrice / 100).toFixed(2)}
+BUYER: wants "${m.buyIntent.itemWanted}" ${priceType}
   - Source: ${m.buyIntent.source} (u/${m.buyIntent.buyerUsername}, ${m.buyIntent.buyerTradeCount} trades)
   - Post: ${m.buyIntent.postUrl}
   - Age: ${m.buyIntent.postAge}h, Location: ${m.buyIntent.location}
 SOURCE: "${m.sourceListing.title}" for $${(m.sourceListing.price / 100).toFixed(2)} on ${m.sourceListing.marketplace}
   - URL: ${m.sourceListing.url}
-FEES: PayPal $${(m.fees.paypalFee / 100).toFixed(2)} + Shipping $${(m.fees.shippingCost / 100).toFixed(2)} = $${(m.fees.total / 100).toFixed(2)}
+FEES: PayPal $${(m.fees.paypalFee / 100).toFixed(2)} + Ship $${(m.fees.shippingCost / 100).toFixed(2)} = $${(m.fees.total / 100).toFixed(2)}
 EST. PROFIT: $${(m.estimatedProfit / 100).toFixed(2)}`;
   }).join('\n\n');
 
-  return `Verify these ${matches.length} buy-intent matches and output structured opportunities.
+  return `Verify these ${topMatches.length} buy-intent matches and output structured opportunities.
 
 ${matchSummaries}
 
@@ -275,7 +290,7 @@ Return verified opportunities as a JSON array wrapped in <opportunities> tags:
 [
   {
     "title": "Short descriptive title of what you're flipping",
-    "description": "Buyer on r/hardwareswap wants X for $Y. Available on eBay for $Z.",
+    "description": "Buyer on r/hardwareswap wants X. Available on eBay for $Z.",
     "buyPrice": 65000,
     "buySource": "eBay",
     "buyUrl": "https://...",
@@ -301,14 +316,13 @@ Return verified opportunities as a JSON array wrapped in <opportunities> tags:
 
 IMPORTANT:
 - All prices in CENTS.
-- buyPrice = what you PAY to the source marketplace (the lower price)
-- sellPrice = what the BUYER on Reddit/Craigslist will pay you (the higher price)
-- sellPriceType is always "verified" (the buyer stated their price)
+- buyPrice = what you PAY to the source (the lower price)
+- sellPrice = what the BUYER will pay you (the higher price)
+- sellPriceType: "verified" if buyer stated their price, "estimated" if we estimated market price
 - buySource = marketplace where you buy (eBay, Amazon, etc.)
-- sellSource = where the buyer is (r/hardwareswap, craigslist-sfbay, etc.)
-- Include buyerUsername, buyerTradeCount, and postAge from the match data
-- If the product match is uncertain, reduce confidence and note it in riskNotes
-- PREFER to include matches rather than exclude them. Let the user decide.`;
+- sellSource = subreddit where the buyer is
+- PREFER to include matches rather than exclude them — let the user decide
+- If a match looks like it could be a different product, include it but lower confidence and add a riskNote`;
 }
 
 // ─── Response Parsing ────────────────────────────────────────────────────────

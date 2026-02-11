@@ -125,10 +125,10 @@ export const AGENT_TYPES: Record<AgentType, AgentTypeInfo> = {
     type: 'buyer-intent',
     name: 'Buy Intent Agent',
     shortName: 'Buy Intent',
-    description: 'Reddit swap subs + Craigslist wanted — proven buyer demand',
+    description: '14 Reddit swap subs — finds buyers willing to overpay, sources cheaper listings',
     icon: '🎯',
     color: '#00d4aa',
-    sources: ['Reddit Swap Subs', 'Craigslist Wanted', 'eBay', 'Amazon', 'Mercari'],
+    sources: ['Reddit Swap Subs (14)', 'eBay', 'Amazon', 'Mercari', 'Swappa', 'Newegg'],
     active: true,
   },
   listings: {

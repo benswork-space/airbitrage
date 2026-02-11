@@ -1,9 +1,14 @@
 /**
- * Source Finder — for each BuyIntent, searches for the item at a lower price on marketplaces.
+ * Source Finder — BRUTE FORCE MODE
  *
- * Uses Tavily to search eBay, Amazon, Mercari for listings.
- * Only accepts results from real listing URLs (isListingUrl).
- * Calculates fees (PayPal G&S + shipping) and filters for profitable matches.
+ * For each BuyIntent, searches for the item on marketplaces.
+ * Two strategies depending on whether the buyer stated a price:
+ *
+ * A) PRICED posts: Search for the item cheaper than buyer's price → profit = buyer - source - fees
+ * B) PRICELESS posts: Search for the item's market price on eBay sold listings.
+ *    If cheap listings exist well below market, that's a potential flip to the buyer.
+ *
+ * Increased search cap to 50 intents. Multiple search strategies per item.
  */
 
 import { extractPrice, isListingUrl } from '@/agents/scout/sources';
@@ -15,7 +20,7 @@ export interface SourceListing {
   title: string;
   price: number;        // cents
   url: string;
-  marketplace: string;  // "eBay", "Amazon", "Mercari", etc.
+  marketplace: string;
 }
 
 export interface MatchedOpportunity {
@@ -28,32 +33,38 @@ export interface MatchedOpportunity {
     total: number;
   };
   confidence: number;
+  /** For priceless intents: estimated market value used as sell price */
+  estimatedMarketPrice?: number;
 }
 
 export interface SourceResult {
   matched: MatchedOpportunity[];
   diagnostics: SourceDiagnostic[];
+  tavilyCallCount: number;
 }
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
-const MIN_PROFIT_CENTS = 2000; // $20 minimum profit
-const MAX_INTENTS_TO_SEARCH = 15;
-const TAVILY_DELAY_MS = 300;
+const MIN_PROFIT_CENTS = 1500;      // $15 minimum profit (lowered)
+const MAX_INTENTS_TO_SEARCH = 50;   // search up to 50 intents
+const TAVILY_DELAY_MS = 250;        // 250ms between calls
 
 /** Shipping estimate by source subreddit category */
 const SHIPPING_ESTIMATES: Record<string, number> = {
-  'r/hardwareswap': 1500,   // $15 — GPUs, components
-  'r/mechmarket': 1000,     // $10 — keyboards
-  'r/photomarket': 1500,    // $15 — cameras, lenses
-  'r/watchexchange': 1200,  // $12 — watches (insured)
-  'r/appleswap': 1500,      // $15 — Apple devices
-  'r/AVexchange': 1500,     // $15 — audio gear
-  'r/gamesale': 800,        // $8 — games, small items
-  'r/homelabsales': 2000,   // $20 — servers, heavy gear
-  'r/Knife_Swap': 800,      // $8 — knives
-  'r/Pen_Swap': 600,        // $6 — pens
-  'r/WantToBuy': 1500,      // $15 — general
+  'r/hardwareswap': 1500,
+  'r/mechmarket': 1000,
+  'r/photomarket': 1500,
+  'r/watchexchange': 1200,
+  'r/appleswap': 1500,
+  'r/AVexchange': 1500,
+  'r/gamesale': 800,
+  'r/homelabsales': 2000,
+  'r/Knife_Swap': 800,
+  'r/Pen_Swap': 600,
+  'r/GunAccessoriesForSale': 1200,
+  'r/comicswap': 600,
+  'r/funkoswap': 800,
+  'r/vinylcollectors': 800,
 };
 
 // ─── Main Source Finder ──────────────────────────────────────────────────────
@@ -65,41 +76,98 @@ export async function findSourcesForIntents(
 ): Promise<SourceResult> {
   const matched: MatchedOpportunity[] = [];
   const diagnostics: SourceDiagnostic[] = [];
+  let tavilyCallCount = 0;
 
-  // Take top N by price (higher value = bigger potential spreads)
   const topIntents = intents.slice(0, MAX_INTENTS_TO_SEARCH);
 
   for (let i = 0; i < topIntents.length; i++) {
     const intent = topIntents[i];
     const start = Date.now();
 
-    onProgress?.(`Searching sources for "${intent.itemWanted.slice(0, 50)}" ($${(intent.maxPrice / 100).toFixed(0)})... [${i + 1}/${topIntents.length}]`);
+    const priceLabel = intent.hasStatedPrice
+      ? `$${(intent.maxPrice / 100).toFixed(0)}`
+      : 'no price';
+
+    onProgress?.(`[${i + 1}/${topIntents.length}] Searching "${intent.itemWanted.slice(0, 40)}" (${priceLabel})...`);
 
     try {
-      const listings = await searchForItem(intent.itemWanted, intent.maxPrice, tavilyApiKey);
+      if (intent.hasStatedPrice) {
+        // Strategy A: buyer has a price — find cheaper sources
+        const listings = await searchForItem(intent.itemWanted, tavilyApiKey);
+        tavilyCallCount++;
 
-      // Find profitable matches
-      for (const listing of listings) {
-        const fees = calculateFees(intent.maxPrice, listing.price, intent.source);
-        const profit = intent.maxPrice - listing.price - fees.total;
+        for (const listing of listings) {
+          if (listing.price >= intent.maxPrice) continue; // not cheaper
 
-        if (profit >= MIN_PROFIT_CENTS) {
-          matched.push({
-            buyIntent: intent,
-            sourceListing: listing,
-            estimatedProfit: profit,
-            fees,
-            confidence: calculateConfidence(intent, listing, profit),
-          });
+          const fees = calculateFees(intent.maxPrice, intent.source);
+          const profit = intent.maxPrice - listing.price - fees.total;
+
+          if (profit >= MIN_PROFIT_CENTS) {
+            matched.push({
+              buyIntent: intent,
+              sourceListing: listing,
+              estimatedProfit: profit,
+              fees,
+              confidence: calculateConfidence(intent, listing, profit),
+            });
+          }
         }
-      }
 
-      diagnostics.push({
-        source: `search:${intent.itemWanted.slice(0, 30)}`,
-        status: listings.length > 0 ? 'success' : 'empty',
-        itemCount: listings.length,
-        durationMs: Date.now() - start,
-      });
+        diagnostics.push({
+          source: `priced:${intent.itemWanted.slice(0, 30)}`,
+          status: listings.length > 0 ? 'success' : 'empty',
+          itemCount: listings.length,
+          durationMs: Date.now() - start,
+        });
+
+      } else {
+        // Strategy B: no price stated — find market price + cheap sources
+        const listings = await searchForItem(intent.itemWanted, tavilyApiKey);
+        tavilyCallCount++;
+
+        if (listings.length < 2) {
+          diagnostics.push({
+            source: `market:${intent.itemWanted.slice(0, 30)}`,
+            status: 'empty',
+            itemCount: listings.length,
+            durationMs: Date.now() - start,
+          });
+          if (i < topIntents.length - 1) await new Promise(r => setTimeout(r, TAVILY_DELAY_MS));
+          continue;
+        }
+
+        // Estimate market price as median of found prices
+        const prices = listings.map(l => l.price).sort((a, b) => a - b);
+        const marketPrice = prices[Math.floor(prices.length / 2)];
+
+        // Find listings significantly below market (>25% below)
+        const cheapThreshold = Math.round(marketPrice * 0.75);
+        const cheapListings = listings.filter(l => l.price <= cheapThreshold);
+
+        for (const listing of cheapListings) {
+          // Use market price as the estimated sell price
+          const fees = calculateFees(marketPrice, intent.source);
+          const profit = marketPrice - listing.price - fees.total;
+
+          if (profit >= MIN_PROFIT_CENTS) {
+            matched.push({
+              buyIntent: { ...intent, maxPrice: marketPrice },
+              sourceListing: listing,
+              estimatedProfit: profit,
+              fees,
+              confidence: calculateConfidence(intent, listing, profit) - 10, // lower confidence for estimated price
+              estimatedMarketPrice: marketPrice,
+            });
+          }
+        }
+
+        diagnostics.push({
+          source: `market:${intent.itemWanted.slice(0, 30)}`,
+          status: cheapListings.length > 0 ? 'success' : 'empty',
+          itemCount: listings.length,
+          durationMs: Date.now() - start,
+        });
+      }
     } catch (err) {
       diagnostics.push({
         source: `search:${intent.itemWanted.slice(0, 30)}`,
@@ -110,36 +178,32 @@ export async function findSourcesForIntents(
       });
     }
 
-    // Rate limit Tavily calls
     if (i < topIntents.length - 1) {
       await new Promise(r => setTimeout(r, TAVILY_DELAY_MS));
     }
   }
 
-  // Sort by profit (highest first)
   matched.sort((a, b) => b.estimatedProfit - a.estimatedProfit);
-
-  return { matched, diagnostics };
+  return { matched, diagnostics, tavilyCallCount };
 }
 
 // ─── Tavily Search ───────────────────────────────────────────────────────────
 
 async function searchForItem(
   itemName: string,
-  maxPriceCents: number,
   tavilyApiKey: string,
 ): Promise<SourceListing[]> {
-  // Build search query targeting marketplaces
-  const query = `"${itemName}" buy price site:ebay.com OR site:amazon.com OR site:mercari.com OR site:swappa.com`;
+  // Broader search — don't restrict to specific sites, let Tavily find deals
+  const query = `buy "${itemName}" price`;
 
   const response = await fetch('https://api.tavily.com/search', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    signal: AbortSignal.timeout(10000),
+    signal: AbortSignal.timeout(12000),
     body: JSON.stringify({
       api_key: tavilyApiKey,
       query,
-      max_results: 8,
+      max_results: 10,
       include_answer: false,
     }),
   });
@@ -158,42 +222,36 @@ async function searchForItem(
   const listings: SourceListing[] = [];
 
   for (const result of results) {
-    // Only accept real listing URLs
-    if (!isListingUrl(result.url)) continue;
+    const marketplace = detectMarketplace(result.url);
+
+    // Accept listing URLs and also known marketplaces
+    if (!isListingUrl(result.url) && marketplace === 'Other') continue;
 
     const text = `${result.title || ''} ${result.content || ''}`;
     const price = extractPrice(text);
 
-    // Must have a price, and it must be lower than buyer's max
     if (!price || price <= 0) continue;
-    if (price >= maxPriceCents) continue; // not profitable
-
-    // Sanity: price should be in reasonable range (not $0.01 or $999,999)
     if (price < 500 || price > 10000000) continue;
 
     listings.push({
       title: (result.title || '').slice(0, 120),
       price,
       url: result.url,
-      marketplace: detectMarketplace(result.url),
+      marketplace,
     });
   }
 
-  // Deduplicate by URL domain + similar price
   return deduplicateListings(listings);
 }
 
 // ─── Fee Calculation ─────────────────────────────────────────────────────────
 
 function calculateFees(
-  buyerPrice: number,
-  _sourcePrice: number,
+  sellPrice: number,
   source: string,
 ): { paypalFee: number; shippingCost: number; total: number } {
   // PayPal Goods & Services: 3.49% + $0.49
-  const paypalFee = Math.round(buyerPrice * 0.0349) + 49;
-
-  // Shipping estimate based on category
+  const paypalFee = Math.round(sellPrice * 0.0349) + 49;
   const shippingCost = SHIPPING_ESTIMATES[source] || 1500;
 
   return {
@@ -210,30 +268,33 @@ function calculateConfidence(
   listing: SourceListing,
   profit: number,
 ): number {
-  let confidence = 50; // base
+  let confidence = 45;
 
-  // Higher profit margin = higher confidence
-  const profitPercent = (profit / intent.maxPrice) * 100;
+  // Profit margin
+  const sellPrice = intent.maxPrice || profit + listing.price;
+  const profitPercent = sellPrice > 0 ? (profit / sellPrice) * 100 : 0;
   if (profitPercent > 30) confidence += 15;
   else if (profitPercent > 20) confidence += 10;
   else if (profitPercent > 10) confidence += 5;
 
-  // Buyer reputation boost
+  // Buyer reputation
   if (intent.buyerTradeCount >= 50) confidence += 10;
   else if (intent.buyerTradeCount >= 20) confidence += 7;
   else if (intent.buyerTradeCount >= 5) confidence += 3;
 
-  // Fresher posts = higher confidence
-  if (intent.postAge <= 2) confidence += 10;
-  else if (intent.postAge <= 6) confidence += 5;
+  // Post freshness
+  if (intent.postAge <= 4) confidence += 10;
+  else if (intent.postAge <= 12) confidence += 5;
+  else if (intent.postAge <= 24) confidence += 2;
 
-  // Known marketplace = higher confidence
+  // Known marketplace
   if (listing.marketplace !== 'Other') confidence += 5;
-
-  // eBay/Amazon are most reliable
   if (listing.marketplace === 'eBay' || listing.marketplace === 'Amazon') confidence += 5;
 
-  return Math.min(95, Math.max(20, confidence));
+  // Stated price = higher confidence
+  if (intent.hasStatedPrice) confidence += 10;
+
+  return Math.min(95, Math.max(15, confidence));
 }
 
 // ─── Utilities ───────────────────────────────────────────────────────────────
@@ -248,6 +309,11 @@ function detectMarketplace(url: string): string {
   if (lower.includes('bestbuy.com')) return 'Best Buy';
   if (lower.includes('target.com')) return 'Target';
   if (lower.includes('newegg.com')) return 'Newegg';
+  if (lower.includes('bhphotovideo.com')) return 'B&H';
+  if (lower.includes('adorama.com')) return 'Adorama';
+  if (lower.includes('reverb.com')) return 'Reverb';
+  if (lower.includes('discogs.com')) return 'Discogs';
+  if (lower.includes('stockx.com')) return 'StockX';
   return 'Other';
 }
 
