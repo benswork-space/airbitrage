@@ -15,6 +15,13 @@ import { AgentType, ACTIVE_AGENTS } from '@/types';
 export async function GET(request: NextRequest) {
   const agentType = request.nextUrl.searchParams.get('agentType') as AgentType;
   const configParam = request.nextUrl.searchParams.get('config');
+  const password = request.nextUrl.searchParams.get('p');
+
+  // Password gate — reject if SITE_PASSWORD is set and doesn't match
+  const sitePassword = process.env.SITE_PASSWORD;
+  if (sitePassword && password !== sitePassword) {
+    return new Response('Unauthorized', { status: 401 });
+  }
 
   if (!agentType || !ACTIVE_AGENTS.includes(agentType)) {
     return new Response('Invalid agent type', { status: 400 });

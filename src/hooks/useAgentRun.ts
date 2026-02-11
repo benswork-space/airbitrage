@@ -153,6 +153,11 @@ export function useAgentRunStore() {
       const params = new URLSearchParams({ agentType });
       if (config) params.set('config', JSON.stringify(config));
 
+      // Attach site password if stored in session
+      const sitePassword = typeof sessionStorage !== 'undefined'
+        ? sessionStorage.getItem('site-password') : null;
+      if (sitePassword) params.set('p', sitePassword);
+
       const eventSource = new EventSource(`/api/stream?${params}`);
       eventSourcesRef.current[agentType] = eventSource;
 
