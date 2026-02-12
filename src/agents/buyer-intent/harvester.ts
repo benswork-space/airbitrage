@@ -75,8 +75,18 @@ const HARVEST_QUERIES = [
 ];
 
 const MIN_PRICE_CENTS = 2500;   // $25 minimum (only for posts that have a price)
-const MAX_POST_AGE_HOURS = 72;  // 72h window
 const TAVILY_DELAY_MS = 250;
+
+/**
+ * Reddit post IDs are sequential base-36 numbers. Newer posts have higher IDs.
+ * Tavily doesn't reliably return published dates for Reddit, so we use relative
+ * ID distance from the newest post to estimate freshness.
+ *
+ * Reddit generates ~300K–700K post IDs per hour (varies by time of day).
+ * Using a generous 100M ID window covers roughly 1–2 weeks of posts.
+ * This filters out months-old stale results while keeping anything recent.
+ */
+const MAX_ID_DISTANCE = 100_000_000; // ~1-2 weeks of Reddit posts
 
 // ─── Main Harvester ──────────────────────────────────────────────────────────
 
@@ -133,8 +143,6 @@ export async function harvestBuyIntents(tavilyApiKey: string): Promise<HarvestRe
 
         // If they stated a price, enforce minimum
         if (intent.hasStatedPrice && intent.maxPrice < MIN_PRICE_CENTS) continue;
-        // Skip stale posts
-        if (intent.postAge > MAX_POST_AGE_HOURS) continue;
 
         allIntents.push(intent);
         intentCount++;
@@ -163,14 +171,53 @@ export async function harvestBuyIntents(tavilyApiKey: string): Promise<HarvestRe
     }
   }
 
+  // ── Filter stale posts using Reddit post IDs ────────────────────
+  // Reddit post IDs are sequential — newer posts have higher numeric IDs.
+  // Since Tavily doesn't give us dates, we compare each post's ID against
+  // the highest ID we found. Anything too far below is months old.
+  const freshIntents = filterByRedditId(allIntents);
+
   // Sort: priced posts first (by price desc), then priceless posts
-  allIntents.sort((a, b) => {
+  freshIntents.sort((a, b) => {
     if (a.hasStatedPrice && !b.hasStatedPrice) return -1;
     if (!a.hasStatedPrice && b.hasStatedPrice) return 1;
     return b.maxPrice - a.maxPrice;
   });
 
-  return { intents: allIntents, diagnostics, tavilyCallCount };
+  return { intents: freshIntents, diagnostics, tavilyCallCount };
+}
+
+// ─── Freshness Filter ───────────────────────────────────────────────────────
+
+/** Extract numeric Reddit post ID from a reddit.com URL */
+function redditPostNumericId(url: string): number {
+  const match = url.match(/\/comments\/(\w+)/);
+  if (!match) return 0;
+  return parseInt(match[1], 36);
+}
+
+/**
+ * Filter intents to only recent posts based on Reddit post IDs.
+ * Takes the max ID seen and keeps only posts within MAX_ID_DISTANCE of it.
+ */
+function filterByRedditId(intents: BuyIntent[]): BuyIntent[] {
+  if (intents.length === 0) return intents;
+
+  // Find the max post ID (most recent post)
+  let maxId = 0;
+  for (const intent of intents) {
+    const id = redditPostNumericId(intent.postUrl);
+    if (id > maxId) maxId = id;
+  }
+
+  if (maxId === 0) return intents; // couldn't parse any IDs
+
+  // Keep only posts within the ID distance threshold
+  return intents.filter(intent => {
+    const id = redditPostNumericId(intent.postUrl);
+    if (id === 0) return false; // couldn't parse ID, skip
+    return (maxId - id) <= MAX_ID_DISTANCE;
+  });
 }
 
 // ─── Tavily Result Parsing ──────────────────────────────────────────────────
