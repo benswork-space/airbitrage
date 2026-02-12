@@ -150,8 +150,18 @@ export function useAgentRunStore() {
     }));
 
     try {
+      // Load previously searched items from sessionStorage for dedup
+      const excludeSearched = getSearchedItems(agentType);
+
+      const mergedConfig = {
+        ...config,
+        ...(excludeSearched.length > 0 ? { excludeSearched } : {}),
+      };
+
       const params = new URLSearchParams({ agentType });
-      if (config) params.set('config', JSON.stringify(config));
+      if (Object.keys(mergedConfig).length > 0) {
+        params.set('config', JSON.stringify(mergedConfig));
+      }
 
       // Attach site password if stored in session
       const sitePassword = typeof sessionStorage !== 'undefined'
@@ -175,6 +185,12 @@ export function useAgentRunStore() {
 
       eventSource.addEventListener('result', (e) => {
         const data = JSON.parse(e.data);
+
+        // Save searched item keys to sessionStorage for dedup on next run
+        if (data.searchedKeys && Array.isArray(data.searchedKeys)) {
+          appendSearchedItems(agentType, data.searchedKeys);
+        }
+
         externalStore.updateAgent(agentType, (prev) => ({
           ...prev,
           opportunities: data.opportunities || [],
@@ -297,4 +313,50 @@ export function useDashboardSummary() {
     agentStates,
     runAgent,
   };
+}
+
+// ─── Session Storage Dedup Helpers ──────────────────────────────────
+// Tracks which intents have been searched across runs within a 24h window.
+// Stored in sessionStorage so it persists across page navigations but
+// clears when the browser tab closes.
+
+const STORAGE_PREFIX = 'airbitrage-searched-';
+const DEDUP_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+interface SearchedRecord {
+  keys: string[];
+  timestamp: number;
+}
+
+function getSearchedItems(agentType: AgentType): string[] {
+  if (typeof sessionStorage === 'undefined') return [];
+  try {
+    const raw = sessionStorage.getItem(`${STORAGE_PREFIX}${agentType}`);
+    if (!raw) return [];
+    const record: SearchedRecord = JSON.parse(raw);
+    // Expire after 24h
+    if (Date.now() - record.timestamp > DEDUP_TTL_MS) {
+      sessionStorage.removeItem(`${STORAGE_PREFIX}${agentType}`);
+      return [];
+    }
+    return record.keys;
+  } catch {
+    return [];
+  }
+}
+
+function appendSearchedItems(agentType: AgentType, newKeys: string[]): void {
+  if (typeof sessionStorage === 'undefined') return;
+  if (!newKeys.length) return;
+  try {
+    const existing = getSearchedItems(agentType);
+    const merged = Array.from(new Set([...existing, ...newKeys]));
+    const record: SearchedRecord = {
+      keys: merged,
+      timestamp: Date.now(),
+    };
+    sessionStorage.setItem(`${STORAGE_PREFIX}${agentType}`, JSON.stringify(record));
+  } catch {
+    // sessionStorage full or unavailable — silently fail
+  }
 }

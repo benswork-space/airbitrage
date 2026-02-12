@@ -27,6 +27,8 @@ export interface BuyerIntentResult {
   success: boolean;
   opportunities: ParsedOpportunity[];
   reasoning: string;
+  /** Item keys that were searched this run — client stores to dedup next run */
+  searchedKeys?: string[];
   totalInputTokens: number;
   totalOutputTokens: number;
   totalToolCalls: number;
@@ -47,33 +49,44 @@ export interface BuyerIntentResult {
 
 export async function runBuyerIntentPipeline(
   config: BuyerIntentConfig,
-  _userConfig: Record<string, unknown>,
+  userConfig: Record<string, unknown>,
   onProgress?: (event: AgentProgressEvent) => void,
 ): Promise<BuyerIntentResult> {
   let totalInputTokens = 0;
   let totalOutputTokens = 0;
 
-  // 4-minute timeout
+  // Previously searched item keys to skip (sent from client sessionStorage)
+  const excludeKeys = new Set<string>(
+    Array.isArray(userConfig.excludeSearched) ? userConfig.excludeSearched as string[] : [],
+  );
+
+  // 60s timeout (Vercel Hobby max)
   const runTimeout = setTimeout(() => {
-    onProgress?.({ type: 'error', message: 'Agent run timed out after 4 minutes.' });
-  }, 240000);
+    onProgress?.({ type: 'error', message: 'Agent run timed out after 60 seconds.' });
+  }, 60000);
 
   try {
     // ── Phase 1: HARVEST (free — Reddit swap subs) ──────────────────
 
     onProgress?.({
       type: 'scouting',
-      message: 'Harvesting buy-intent posts from 14 Reddit swap subs (100 posts each)...',
+      message: 'Harvesting buy-intent posts from 14 Reddit swap subs...',
     });
 
     const harvest = await harvestBuyIntents();
 
-    const pricedCount = harvest.intents.filter(i => i.hasStatedPrice).length;
-    const pricelessCount = harvest.intents.length - pricedCount;
+    // Filter out previously searched items
+    const freshIntents = excludeKeys.size > 0
+      ? harvest.intents.filter(i => !excludeKeys.has(intentKey(i)))
+      : harvest.intents;
+
+    const skippedCount = harvest.intents.length - freshIntents.length;
+    const pricedCount = freshIntents.filter(i => i.hasStatedPrice).length;
+    const pricelessCount = freshIntents.length - pricedCount;
 
     // Build source breakdown
     const sourceCounts = new Map<string, number>();
-    for (const intent of harvest.intents) {
+    for (const intent of freshIntents) {
       sourceCounts.set(intent.source, (sourceCounts.get(intent.source) || 0) + 1);
     }
     const sourceBreakdown = [...sourceCounts.entries()]
@@ -82,26 +95,31 @@ export async function runBuyerIntentPipeline(
       .map(([src, cnt]) => `${cnt} from ${src}`)
       .join(', ');
 
+    const skipMsg = skippedCount > 0 ? ` Skipped ${skippedCount} already searched.` : '';
+
     onProgress?.({
       type: 'scouting',
-      message: `Found ${harvest.intents.length} buy-intent posts (${pricedCount} with price, ${pricelessCount} without). ${sourceBreakdown}.`,
-      data: { intents: harvest.intents.length, priced: pricedCount, priceless: pricelessCount },
+      message: `Found ${freshIntents.length} new buy-intent posts (${pricedCount} with price, ${pricelessCount} without).${skipMsg} ${sourceBreakdown}.`,
+      data: { intents: freshIntents.length, priced: pricedCount, priceless: pricelessCount, skipped: skippedCount },
     });
 
-    if (harvest.intents.length === 0) {
+    if (freshIntents.length === 0) {
       clearTimeout(runTimeout);
-      onProgress?.({ type: 'completed', message: 'No buy-intent posts found. Try again later.' });
+      const reason = skippedCount > 0
+        ? `All ${harvest.intents.length} buy-intent posts were already searched in previous runs. New posts will appear as Reddit refreshes.`
+        : 'No buy-intent posts found in any subreddit within the 72h window.';
+      onProgress?.({ type: 'completed', message: reason });
 
       return {
         success: true,
         opportunities: [],
-        reasoning: 'No buy-intent posts found in any subreddit within the 72h window.',
+        reasoning: reason,
         totalInputTokens: 0,
         totalOutputTokens: 0,
         totalToolCalls: 0,
         estimatedCost: 0,
         scoutStats: {
-          intentsFound: 0,
+          intentsFound: harvest.intents.length,
           intentsSearched: 0,
           matchesFound: 0,
           tavilySearches: 0,
@@ -111,9 +129,9 @@ export async function runBuyerIntentPipeline(
       };
     }
 
-    // ── Phase 2: SOURCE (Tavily — up to 50 searches) ──────────────────
+    // ── Phase 2: SOURCE (Tavily — up to 20 searches) ──────────────────
 
-    const searchCount = Math.min(harvest.intents.length, 50);
+    const searchCount = Math.min(freshIntents.length, 20);
 
     onProgress?.({
       type: 'scouting',
@@ -121,10 +139,13 @@ export async function runBuyerIntentPipeline(
     });
 
     const sourceResult = await findSourcesForIntents(
-      harvest.intents,
+      freshIntents,
       config.tavilyApiKey,
       (msg) => onProgress?.({ type: 'scouting', message: msg }),
     );
+
+    // Build list of searched item keys for client dedup
+    const searchedKeys = freshIntents.slice(0, searchCount).map(intentKey);
 
     onProgress?.({
       type: 'scouting',
@@ -136,13 +157,14 @@ export async function runBuyerIntentPipeline(
       clearTimeout(runTimeout);
       onProgress?.({
         type: 'completed',
-        message: `Searched ${searchCount} buy intents (${sourceResult.tavilyCallCount} Tavily calls) — no profitable matches found.`,
+        message: `Searched ${searchCount} buy intents (${sourceResult.tavilyCallCount} Tavily calls) — no profitable matches found. Run again to search different items.`,
       });
 
       return {
         success: true,
         opportunities: [],
         reasoning: `Searched ${searchCount} buy intents — source prices were at or above buyer prices after fees.`,
+        searchedKeys,
         totalInputTokens: 0,
         totalOutputTokens: 0,
         totalToolCalls: 0,
@@ -213,6 +235,7 @@ export async function runBuyerIntentPipeline(
       success: true,
       opportunities,
       reasoning: extractReasoning(response),
+      searchedKeys,
       totalInputTokens,
       totalOutputTokens,
       totalToolCalls: 1,
@@ -243,6 +266,13 @@ export async function runBuyerIntentPipeline(
       error,
     };
   }
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/** Stable key for a buy-intent post — used for cross-run deduplication */
+function intentKey(intent: { itemWanted: string; buyerUsername: string; source: string }): string {
+  return `${intent.source}:${intent.buyerUsername}:${intent.itemWanted.slice(0, 60).toLowerCase().replace(/\s+/g, '-')}`;
 }
 
 // ─── Claude Verification ─────────────────────────────────────────────────────

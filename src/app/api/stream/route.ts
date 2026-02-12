@@ -93,6 +93,8 @@ export async function GET(request: NextRequest) {
               estimatedCost: result.estimatedCost,
               scoutStats: 'scoutStats' in result ? (result as unknown as { scoutStats: unknown }).scoutStats : null,
             },
+            // Pass searched item keys so client can dedup across runs
+            searchedKeys: 'searchedKeys' in result ? (result as unknown as { searchedKeys: string[] }).searchedKeys : undefined,
             error: result.error,
             abortReason: result.abortReason,
           });

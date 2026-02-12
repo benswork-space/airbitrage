@@ -46,8 +46,8 @@ export interface SourceResult {
 // ─── Configuration ───────────────────────────────────────────────────────────
 
 const MIN_PROFIT_CENTS = 1500;      // $15 minimum profit (lowered)
-const MAX_INTENTS_TO_SEARCH = 50;   // search up to 50 intents
-const TAVILY_DELAY_MS = 250;        // 250ms between calls
+const MAX_INTENTS_TO_SEARCH = 20;   // 20 searches to fit Vercel Hobby timeout
+const TAVILY_DELAY_MS = 200;        // 200ms between calls
 
 /** Shipping estimate by source subreddit category */
 const SHIPPING_ESTIMATES: Record<string, number> = {
