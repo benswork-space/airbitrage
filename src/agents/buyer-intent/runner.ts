@@ -1,12 +1,13 @@
 /**
- * Buy-Intent Pipeline Runner — BRUTE FORCE MODE
+ * Buy-Intent Pipeline Runner
  *
  * Orchestrates the 3-phase pipeline:
- * 1. HARVEST — fetch buy-intent posts from Reddit swap subs (free)
- * 2. SOURCE — find cheaper listings via Tavily (up to 50 searches, ~$0.05)
+ * 1. HARVEST — find buy-intent posts from Reddit swap subs via Tavily (~6 calls)
+ * 2. SOURCE — find cheaper listings via Tavily (up to 14 searches)
  * 3. VERIFY — Claude confirms product match + fees (only if matches found)
  *
- * Timeout: 4 minutes (harvest ~6s, source ~30-60s, verify ~5s)
+ * Timeout: 60s (Vercel Hobby max)
+ * Total Tavily budget: ~20 calls (6 harvest + 14 source)
  */
 
 import { callClaude, ClaudeResponse } from '@/lib/claude';
@@ -66,14 +67,14 @@ export async function runBuyerIntentPipeline(
   }, 60000);
 
   try {
-    // ── Phase 1: HARVEST (free — Reddit swap subs) ──────────────────
+    // ── Phase 1: HARVEST (Tavily searches for Reddit buy posts) ─────
 
     onProgress?.({
       type: 'scouting',
-      message: 'Harvesting buy-intent posts from 14 Reddit swap subs...',
+      message: 'Searching Reddit swap subs for buy-intent posts via Tavily...',
     });
 
-    const harvest = await harvestBuyIntents();
+    const harvest = await harvestBuyIntents(config.tavilyApiKey);
 
     // Filter out previously searched items
     const freshIntents = excludeKeys.size > 0
@@ -117,21 +118,22 @@ export async function runBuyerIntentPipeline(
         totalInputTokens: 0,
         totalOutputTokens: 0,
         totalToolCalls: 0,
-        estimatedCost: 0,
+        estimatedCost: harvest.tavilyCallCount * 0.001,
         scoutStats: {
           intentsFound: harvest.intents.length,
           intentsSearched: 0,
           matchesFound: 0,
-          tavilySearches: 0,
+          tavilySearches: harvest.tavilyCallCount,
           sourcesChecked: harvest.diagnostics.map(d => d.source),
           diagnostics: harvest.diagnostics,
         },
       };
     }
 
-    // ── Phase 2: SOURCE (Tavily — up to 20 searches) ──────────────────
+    // ── Phase 2: SOURCE (Tavily — up to 14 searches) ──────────────────
+    // Budget: ~20 total Tavily calls. Harvest used ~6, leaving ~14 for sourcing.
 
-    const searchCount = Math.min(freshIntents.length, 20);
+    const searchCount = Math.min(freshIntents.length, 14);
 
     onProgress?.({
       type: 'scouting',
@@ -160,6 +162,7 @@ export async function runBuyerIntentPipeline(
         message: `Searched ${searchCount} buy intents (${sourceResult.tavilyCallCount} Tavily calls) — no profitable matches found. Run again to search different items.`,
       });
 
+      const totalTavilyCalls = harvest.tavilyCallCount + sourceResult.tavilyCallCount;
       return {
         success: true,
         opportunities: [],
@@ -168,12 +171,12 @@ export async function runBuyerIntentPipeline(
         totalInputTokens: 0,
         totalOutputTokens: 0,
         totalToolCalls: 0,
-        estimatedCost: sourceResult.tavilyCallCount * 0.001,
+        estimatedCost: totalTavilyCalls * 0.001,
         scoutStats: {
           intentsFound: harvest.intents.length,
           intentsSearched: searchCount,
           matchesFound: 0,
-          tavilySearches: sourceResult.tavilyCallCount,
+          tavilySearches: totalTavilyCalls,
           sourcesChecked: [...harvest.diagnostics, ...sourceResult.diagnostics].map(d => d.source),
           diagnostics: [...harvest.diagnostics, ...sourceResult.diagnostics],
         },
@@ -193,7 +196,7 @@ export async function runBuyerIntentPipeline(
         totalInputTokens: 0,
         totalOutputTokens: 0,
         totalToolCalls: 0,
-        estimatedCost: sourceResult.tavilyCallCount * 0.001,
+        estimatedCost: (harvest.tavilyCallCount + sourceResult.tavilyCallCount) * 0.001,
         abortReason: `Daily token budget exceeded (${budget.used.toLocaleString()} / ${budget.limit.toLocaleString()})`,
       };
     }
@@ -221,13 +224,14 @@ export async function runBuyerIntentPipeline(
 
     const opportunities = parseOpportunities(response);
     const claudeCost = estimateCost(totalInputTokens, totalOutputTokens);
-    const totalCost = claudeCost + (sourceResult.tavilyCallCount * 0.001);
+    const totalTavilyCalls = harvest.tavilyCallCount + sourceResult.tavilyCallCount;
+    const totalCost = claudeCost + (totalTavilyCalls * 0.001);
 
     clearTimeout(runTimeout);
 
     onProgress?.({
       type: 'completed',
-      message: `Verified ${opportunities.length} opportunities from ${sourceResult.matched.length} matches. ${sourceResult.tavilyCallCount} Tavily searches + ${totalInputTokens + totalOutputTokens} tokens = $${totalCost.toFixed(4)}.`,
+      message: `Verified ${opportunities.length} opportunities from ${sourceResult.matched.length} matches. ${totalTavilyCalls} Tavily searches + ${totalInputTokens + totalOutputTokens} tokens = $${totalCost.toFixed(4)}.`,
       data: { opportunities: opportunities.length, tokens: totalInputTokens + totalOutputTokens, cost: totalCost },
     });
 
@@ -244,7 +248,7 @@ export async function runBuyerIntentPipeline(
         intentsFound: harvest.intents.length,
         intentsSearched: searchCount,
         matchesFound: sourceResult.matched.length,
-        tavilySearches: sourceResult.tavilyCallCount,
+        tavilySearches: totalTavilyCalls,
         sourcesChecked: [...harvest.diagnostics, ...sourceResult.diagnostics].map(d => d.source),
         diagnostics: [...harvest.diagnostics, ...sourceResult.diagnostics],
       },

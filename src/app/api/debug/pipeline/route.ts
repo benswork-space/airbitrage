@@ -48,9 +48,9 @@ export async function GET(request: NextRequest) {
       });
     }
 
-    // Step 2: Harvest from Reddit
+    // Step 2: Harvest from Reddit via Tavily
     const harvestStart = Date.now();
-    const harvest = await harvestBuyIntents();
+    const harvest = await harvestBuyIntents(keys.tavilyApiKey);
     const priced = harvest.intents.filter(i => i.hasStatedPrice);
     const priceless = harvest.intents.filter(i => !i.hasStatedPrice);
     steps.push({

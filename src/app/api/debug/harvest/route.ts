@@ -1,10 +1,11 @@
 /**
  * GET /api/debug/harvest — diagnostic endpoint that runs ONLY the harvester
- * and returns raw results. No Tavily or Claude costs.
+ * and returns raw results. Now uses Tavily (~6 calls, ~$0.006).
  */
 
 import { NextRequest, NextResponse } from 'next/server';
 import { harvestBuyIntents } from '@/agents/buyer-intent/harvester';
+import { getApiKeys } from '@/lib/api-keys';
 
 export const maxDuration = 60;
 
@@ -15,9 +16,14 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
+  const keys = await getApiKeys();
+  if (!keys.tavilyApiKey) {
+    return NextResponse.json({ error: 'Tavily API key not configured' }, { status: 400 });
+  }
+
   try {
     const start = Date.now();
-    const result = await harvestBuyIntents();
+    const result = await harvestBuyIntents(keys.tavilyApiKey);
     const elapsed = Date.now() - start;
 
     const pricedIntents = result.intents.filter(i => i.hasStatedPrice);
@@ -25,6 +31,7 @@ export async function GET(request: NextRequest) {
 
     return NextResponse.json({
       elapsed: `${elapsed}ms`,
+      tavilyCallCount: result.tavilyCallCount,
       totalIntents: result.intents.length,
       pricedCount: pricedIntents.length,
       pricelessCount: pricelessIntents.length,

@@ -1,9 +1,13 @@
 /**
- * Buy-Intent Harvester — fetches buy-intent posts from Reddit swap subs.
+ * Buy-Intent Harvester — finds buy-intent posts from Reddit swap subs via Tavily.
  *
- * BRUTE FORCE MODE: We keep ALL buy-intent posts, even those without a stated
- * price. The sourcer will look up market prices for priceless posts.
- * This maximizes the number of opportunities we can evaluate.
+ * Reddit blocks direct API requests from cloud providers (Vercel/AWS get 403).
+ * So we use Tavily's search API to find recent buy posts on swap subreddits.
+ *
+ * Strategy: Run targeted Tavily searches for "[H] PayPal [W]" and "[WTB]" posts
+ * across swap subs, then parse the results into BuyIntent objects.
+ *
+ * Cost: ~6 Tavily calls = ~$0.006 per harvest.
  */
 
 import { extractPrice } from '@/agents/scout/sources';
@@ -35,89 +39,127 @@ export interface SourceDiagnostic {
 export interface HarvestResult {
   intents: BuyIntent[];
   diagnostics: SourceDiagnostic[];
+  tavilyCallCount: number;
 }
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
-/** Reddit swap subs that use [H]/[W] format */
-const HW_FORMAT_SUBS = [
-  'hardwareswap',
-  'mechmarket',
-  'photomarket',
-  'appleswap',
-  'AVexchange',
-  'gamesale',
-  'homelabsales',
-  'Knife_Swap',
-  'Pen_Swap',
-  'GunAccessoriesForSale',
-  'comicswap',
-  'funkoswap',
-];
-
-/** Reddit subs that use [WTB] format */
-const WTB_FORMAT_SUBS = [
-  'watchexchange',
-  'vinylcollectors',
+/** Tavily search queries — each targets a group of swap subs for buy posts */
+const HARVEST_QUERIES = [
+  // High-volume [H]/[W] subs
+  {
+    query: 'site:reddit.com/r/hardwareswap "[H] PayPal" OR "[H] Cash" OR "[H] Paypal, Local"',
+    label: 'hardwareswap',
+  },
+  {
+    query: 'site:reddit.com/r/mechmarket "[H] PayPal" OR "[H] Cash"',
+    label: 'mechmarket',
+  },
+  {
+    query: 'site:reddit.com/r/appleswap OR site:reddit.com/r/photomarket "[H] PayPal" OR "[H] Cash"',
+    label: 'appleswap+photomarket',
+  },
+  {
+    query: 'site:reddit.com/r/AVexchange OR site:reddit.com/r/gamesale "[H] PayPal" OR "[H] Cash"',
+    label: 'AVexchange+gamesale',
+  },
+  {
+    query: 'site:reddit.com/r/Pen_Swap OR site:reddit.com/r/comicswap OR site:reddit.com/r/Knife_Swap "[H] PayPal" OR "[H] Cash"',
+    label: 'Pen_Swap+comicswap+Knife_Swap',
+  },
+  // [WTB] subs + remaining
+  {
+    query: 'site:reddit.com/r/watchexchange "[WTB]" OR site:reddit.com/r/vinylcollectors "[WTB]" OR site:reddit.com/r/homelabsales "[H] PayPal"',
+    label: 'watchexchange+vinylcollectors+homelabsales',
+  },
 ];
 
 const MIN_PRICE_CENTS = 2500;   // $25 minimum (only for posts that have a price)
 const MAX_POST_AGE_HOURS = 72;  // 72h window
-const REDDIT_DELAY_MS = 400;
-const POSTS_PER_SUB = 100;      // max out Reddit's limit
+const TAVILY_DELAY_MS = 250;
 
 // ─── Main Harvester ──────────────────────────────────────────────────────────
 
-export async function harvestBuyIntents(): Promise<HarvestResult> {
+export async function harvestBuyIntents(tavilyApiKey: string): Promise<HarvestResult> {
   const allIntents: BuyIntent[] = [];
   const diagnostics: SourceDiagnostic[] = [];
+  let tavilyCallCount = 0;
+  const seenUrls = new Set<string>();
 
-  const allSubs = [...HW_FORMAT_SUBS, ...WTB_FORMAT_SUBS];
+  for (let i = 0; i < HARVEST_QUERIES.length; i++) {
+    const { query, label } = HARVEST_QUERIES[i];
+    const start = Date.now();
 
-  // Fetch in parallel batches of 4 to stay under Reddit rate limits
-  // but finish much faster than sequential (~3s vs ~8s)
-  const BATCH_SIZE = 4;
-  for (let i = 0; i < allSubs.length; i += BATCH_SIZE) {
-    const batch = allSubs.slice(i, i + BATCH_SIZE);
-    const results = await Promise.allSettled(
-      batch.map(async (sub) => {
-        const start = Date.now();
-        try {
-          const intents = await fetchRedditSubreddit(sub);
-          return {
-            diagnostic: {
-              source: `r/${sub}`,
-              status: (intents.length > 0 ? 'success' : 'empty') as SourceDiagnostic['status'],
-              itemCount: intents.length,
-              durationMs: Date.now() - start,
-            },
-            intents,
-          };
-        } catch (err) {
-          return {
-            diagnostic: {
-              source: `r/${sub}`,
-              status: 'error' as const,
-              itemCount: 0,
-              durationMs: Date.now() - start,
-              error: err instanceof Error ? err.message : String(err),
-            },
-            intents: [] as BuyIntent[],
-          };
-        }
-      }),
-    );
+    try {
+      const response = await fetch('https://api.tavily.com/search', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: AbortSignal.timeout(12000),
+        body: JSON.stringify({
+          api_key: tavilyApiKey,
+          query,
+          max_results: 20,
+          search_depth: 'basic',
+          include_answer: false,
+          topic: 'general',
+        }),
+      });
 
-    for (const result of results) {
-      if (result.status === 'fulfilled') {
-        diagnostics.push(result.value.diagnostic);
-        allIntents.push(...result.value.intents);
+      tavilyCallCount++;
+
+      if (!response.ok) {
+        throw new Error(`Tavily returned ${response.status}`);
       }
+
+      const data = await response.json();
+      const results = (data.results || []) as Array<{
+        url: string;
+        title?: string;
+        content?: string;
+        published_date?: string;
+      }>;
+
+      let intentCount = 0;
+
+      for (const result of results) {
+        // Only accept Reddit URLs
+        if (!result.url.includes('reddit.com')) continue;
+        // Dedup
+        if (seenUrls.has(result.url)) continue;
+        seenUrls.add(result.url);
+
+        const intent = parseTavilyResult(result);
+        if (!intent) continue;
+
+        // If they stated a price, enforce minimum
+        if (intent.hasStatedPrice && intent.maxPrice < MIN_PRICE_CENTS) continue;
+        // Skip stale posts
+        if (intent.postAge > MAX_POST_AGE_HOURS) continue;
+
+        allIntents.push(intent);
+        intentCount++;
+      }
+
+      diagnostics.push({
+        source: label,
+        status: intentCount > 0 ? 'success' : 'empty',
+        itemCount: intentCount,
+        durationMs: Date.now() - start,
+      });
+
+    } catch (err) {
+      diagnostics.push({
+        source: label,
+        status: 'error',
+        itemCount: 0,
+        durationMs: Date.now() - start,
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
 
-    // Small delay between batches
-    if (i + BATCH_SIZE < allSubs.length) {
-      await new Promise(r => setTimeout(r, 300));
+    // Delay between Tavily calls
+    if (i < HARVEST_QUERIES.length - 1) {
+      await new Promise(r => setTimeout(r, TAVILY_DELAY_MS));
     }
   }
 
@@ -128,82 +170,32 @@ export async function harvestBuyIntents(): Promise<HarvestResult> {
     return b.maxPrice - a.maxPrice;
   });
 
-  return { intents: allIntents, diagnostics };
+  return { intents: allIntents, diagnostics, tavilyCallCount };
 }
 
-// ─── Reddit Fetching ─────────────────────────────────────────────────────────
+// ─── Tavily Result Parsing ──────────────────────────────────────────────────
 
-interface RedditPost {
-  title: string;
-  author: string;
-  author_flair_text: string | null;
-  permalink: string;
-  created_utc: number;
-  subreddit: string;
-  link_flair_text: string | null;
-  selftext: string;
-}
+function parseTavilyResult(result: {
+  url: string;
+  title?: string;
+  content?: string;
+  published_date?: string;
+}): BuyIntent | null {
+  const title = result.title || '';
+  const content = result.content || '';
+  const url = result.url;
 
-async function fetchRedditSubreddit(subreddit: string): Promise<BuyIntent[]> {
-  const url = `https://www.reddit.com/r/${subreddit}/new.json?limit=${POSTS_PER_SUB}`;
-
-  const response = await fetch(url, {
-    signal: AbortSignal.timeout(10000),
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (compatible; Airbitrage/1.0)',
-      Accept: 'application/json',
-    },
-  });
-
-  if (!response.ok) {
-    throw new Error(`Reddit returned ${response.status}`);
-  }
-
-  const data = await response.json();
-  const posts: RedditPost[] = (data?.data?.children || []).map(
-    (child: { data: RedditPost }) => child.data,
-  );
-
-  const intents: BuyIntent[] = [];
-  const nowSec = Date.now() / 1000;
-
-  for (const post of posts) {
-    const ageHours = (nowSec - post.created_utc) / 3600;
-    if (ageHours > MAX_POST_AGE_HOURS) continue;
-
-    const intent = parseBuyIntentFromPost(post, subreddit, ageHours);
-    if (!intent) continue;
-
-    // If they stated a price, enforce minimum
-    if (intent.hasStatedPrice && intent.maxPrice < MIN_PRICE_CENTS) continue;
-
-    // If no price, keep it — sourcer will look up market price
-    intents.push(intent);
-  }
-
-  return intents;
-}
-
-// ─── Post Classification ─────────────────────────────────────────────────────
-
-function parseBuyIntentFromPost(
-  post: RedditPost,
-  subreddit: string,
-  ageHours: number,
-): BuyIntent | null {
-  const title = post.title;
-  const selftext = post.selftext || '';
+  // Extract subreddit from URL
+  const subMatch = url.match(/reddit\.com\/r\/(\w+)/);
+  if (!subMatch) return null;
+  const subreddit = subMatch[1];
 
   // ── Buy signal detection ───────────────────────────────────────────
-  const flairIsBuying = post.link_flair_text
-    && /^buy/i.test(post.link_flair_text.trim());
-
   const hwResult = parseHWFormat(title);
   const isHWBuyPost = hwResult !== null;
-
   const isWTBPost = /\[WTB\]/i.test(title);
 
-  if (!flairIsBuying && !isHWBuyPost && !isWTBPost) return null;
+  if (!isHWBuyPost && !isWTBPost) return null;
 
   // ── Extract item wanted ────────────────────────────────────────────
   let itemWanted: string;
@@ -220,7 +212,7 @@ function parseBuyIntentFromPost(
 
   if (itemWanted.length < 3) return null;
 
-  // ── Extract price (may be 0 = unknown) ─────────────────────────────
+  // ── Extract price ─────────────────────────────────────────────────
   let maxPrice: number | null = null;
 
   if (hwResult?.maxPrice) {
@@ -229,11 +221,28 @@ function parseBuyIntentFromPost(
   if (!maxPrice) {
     maxPrice = extractPrice(title);
   }
-  if (!maxPrice && selftext.length > 0) {
-    maxPrice = extractBestPriceFromBody(selftext);
+  if (!maxPrice && content.length > 0) {
+    maxPrice = extractBestPriceFromBody(content);
   }
 
   const hasStatedPrice = maxPrice !== null && maxPrice > 0;
+
+  // ── Post age ──────────────────────────────────────────────────────
+  let postAge = 24; // default if unknown
+  let created = Math.floor(Date.now() / 1000) - (postAge * 3600);
+
+  if (result.published_date) {
+    const pubDate = new Date(result.published_date);
+    if (!isNaN(pubDate.getTime())) {
+      const ageMs = Date.now() - pubDate.getTime();
+      postAge = Math.max(0, Math.round(ageMs / (1000 * 3600)));
+      created = Math.floor(pubDate.getTime() / 1000);
+    }
+  }
+
+  // ── Extract username from URL ─────────────────────────────────────
+  // Tavily doesn't give us the author, so default to 'unknown'
+  const buyerUsername = 'unknown';
 
   return {
     title,
@@ -241,12 +250,12 @@ function parseBuyIntentFromPost(
     maxPrice: maxPrice || 0,
     hasStatedPrice,
     location: extractLocation(title),
-    buyerUsername: post.author,
-    buyerTradeCount: parseTradeCount(post.author_flair_text),
+    buyerUsername,
+    buyerTradeCount: 0,
     source: `r/${subreddit}`,
-    postUrl: `https://www.reddit.com${post.permalink}`,
-    postAge: Math.round(ageHours),
-    created: post.created_utc,
+    postUrl: url,
+    postAge,
+    created,
   };
 }
 
@@ -323,18 +332,4 @@ function extractLocation(title: string): string {
   if (countryMatch) return countryMatch[1].toUpperCase();
 
   return 'unknown';
-}
-
-function parseTradeCount(flair: string | null): number {
-  if (!flair) return 0;
-
-  const match = flair.match(/(\d+)\s*(?:trades?|confirmed|swaps?)/i)
-    || flair.match(/(?:trades?|confirmed|swaps?)\s*:?\s*(\d+)/i);
-
-  if (match) return parseInt(match[1], 10);
-
-  const numMatch = flair.match(/^\d+$/);
-  if (numMatch) return parseInt(numMatch[0], 10);
-
-  return 0;
 }
