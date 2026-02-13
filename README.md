@@ -25,7 +25,7 @@ The result: a feed of opportunities where a real buyer is willing to pay more th
 ### Setup
 
 ```bash
-git clone https://github.com/claudecode609-hub/airbitrage.git
+git clone https://github.com/benswork-space/airbitrage.git
 cd airbitrage
 npm install
 ```
